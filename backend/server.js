@@ -20,6 +20,84 @@ const pool = new Pool({
 
 // ── AI ──────────────────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const FORCE_DEMO_AI = process.env.DEMO_AI_MODE === 'true';
+
+// ── Mock AI (demo fallback) ──────────────────────────────────────────────────
+// Used automatically if the real Anthropic call fails (e.g. no credits),
+// or always if DEMO_AI_MODE=true. Produces realistic, data-aware responses
+// so the app still looks fully functional in demos without API cost.
+function mockChatReply(message, ctx) {
+  const m = message.toLowerCase();
+  const top = ctx.tasks[0];
+  const topTitle = top ? top.title : 'your top task';
+  const overdue = ctx.tasks.find(t => t.due_date && new Date(t.due_date) < new Date());
+  const goal = ctx.goals[0];
+  const habit = ctx.habits[0];
+
+  if (m.includes('what should i') || m.includes('focus') || m.includes('work on') || m.includes('priorit')) {
+    return `Right now, "${topTitle}" should be your focus — it has the highest AI priority score in your list${top?.due_date ? ` and is due ${new Date(top.due_date).toLocaleDateString()}` : ''}. ${overdue ? `Heads up, "${overdue.title}" is overdue and worth clearing first if it's quick.` : 'Block 60-90 minutes for it during your peak focus window this morning.'} Tackle that before anything lower priority pulls your attention.`;
+  }
+  if (m.includes('tomorrow') || m.includes('plan my')) {
+    return `For tomorrow, I'd front-load your highest-impact work early: start with "${topTitle}" right after your morning review, since your focus is sharpest before noon. Leave communication-heavy tasks for early afternoon, and reserve a buffer block around 3 PM in case anything urgent comes up. ${goal ? `Also worth chipping away at "${goal.title}" — you're at ${goal.progress}%.` : ''}`;
+  }
+  if (m.includes('risk') || m.includes('deadline') || m.includes('overdue') || m.includes('miss')) {
+    return overdue
+      ? `"${overdue.title}" is currently overdue and is your biggest risk right now — I'd address it today before starting anything new. ${ctx.tasks.length > 1 ? `Keep an eye on "${ctx.tasks[1]?.title}" too, it's trending high priority.` : ''}`
+      : `Nothing is overdue right now, which is great. "${topTitle}" is closest to becoming time-sensitive, so I'd knock that out next to stay ahead of it.`;
+  }
+  if (m.includes('tip') || m.includes('advice') || m.includes('how can i') || m.includes('improve')) {
+    return `One thing that would help: batch similar tasks together instead of context-switching. You've got a mix of deep work and quick admin items — try clearing the quick ones first thing, then protect a longer uninterrupted block for "${topTitle}". ${habit ? `Also, your "${habit.name}" streak is at ${habit.streak} days — keep that going, consistency compounds.` : ''}`;
+  }
+  if (m.includes('goal') || m.includes('break') || m.includes('blocker')) {
+    return goal
+      ? `For "${goal.title}", you're at ${goal.progress}% — a solid push forward would be breaking the remaining work into 2-3 smaller tasks this week rather than one big block. Momentum matters more than perfection here.`
+      : `You don't have any goals set yet — adding one or two clear targets would help me give you sharper, more specific guidance.`;
+  }
+  // generic fallback
+  return `Looking at your current workload, "${topTitle}" stands out as the highest-leverage thing to tackle next${overdue ? `, though "${overdue.title}" is overdue and may need attention first` : ''}. You have ${ctx.tasks.length} open tasks right now — want me to help prioritize the rest, or build out a schedule around them?`;
+}
+
+function mockSchedule(tasks) {
+  const top = tasks.slice(0, 6);
+  const slots = [
+    { time: '8:00 AM', type: 'teal', duration: '20 min', ai_note: 'Set intentions for the day' , title: 'Morning review & planning' },
+    { time: '9:00 AM', type: 'purple', duration: '90 min', ai_note: 'Peak focus window' },
+    { time: '10:30 AM', type: 'gray', duration: '15 min', ai_note: 'Recharge', title: 'Short break' },
+    { time: '11:00 AM', type: 'purple', duration: '60 min', ai_note: 'Still high focus' },
+    { time: '12:00 PM', type: 'gray', duration: '60 min', ai_note: 'Rest', title: 'Lunch break' },
+    { time: '1:00 PM', type: 'coral', duration: '45 min', ai_note: 'Lower-energy task slot' },
+    { time: '2:00 PM', type: 'teal', duration: '60 min', ai_note: 'Collaboration window' },
+    { time: '3:00 PM', type: 'ai', duration: '60 min', ai_note: 'Protected overflow time', title: 'AI focus buffer (protected)' },
+    { time: '4:00 PM', type: 'gray', duration: '45 min', ai_note: 'Wind down', title: 'Admin & miscellaneous' },
+    { time: '5:00 PM', type: 'teal', duration: '15 min', ai_note: 'Close open loops', title: 'Daily shutdown review' },
+  ];
+  let ti = 0;
+  return slots.map(s => {
+    if (!s.title) {
+      const t = top[ti++];
+      return { ...s, title: t ? t.title : 'Focus block' };
+    }
+    return s;
+  });
+}
+
+function mockTaskSuggestions(goals) {
+  const base = [
+    { title: 'Review weekly priorities', priority: 'high', category: 'Planning' },
+    { title: 'Follow up with key stakeholders', priority: 'medium', category: 'Communication' },
+    { title: 'Document progress on current project', priority: 'medium', category: 'Documentation' },
+  ];
+  if (goals?.[0]) {
+    base[0] = { title: `Make progress on "${goals[0].title}"`, priority: 'high', category: 'Goals' };
+  }
+  return base;
+}
+
+function mockInsight(ctx) {
+  const top = ctx.tasks[0];
+  if (!top) return "You're all caught up! Consider adding a new goal or reviewing your habits to keep momentum going.";
+  return `Your highest priority right now is "${top.title}" (AI score ${top.ai_score}). You have ${ctx.tasks.length} open tasks — tackling the top one first will have the biggest impact on your day.`;
+}
 
 // ── Middleware ───────────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -341,6 +419,16 @@ app.post('/api/ai/chat', auth, async (req, res) => {
     ]);
     const userRes = await pool.query('SELECT name,productivity_score,streak FROM users WHERE id=$1', [req.user.id]);
     const user = userRes.rows[0];
+    const ctx = { tasks: tasksRes.rows, goals: goalsRes.rows, habits: habitsRes.rows };
+
+    // Save user message regardless of which AI path we use
+    await pool.query('INSERT INTO chat_history (user_id,role,content) VALUES ($1,$2,$3)', [req.user.id, 'user', message]);
+
+    if (FORCE_DEMO_AI) {
+      const reply = mockChatReply(message, ctx);
+      await pool.query('INSERT INTO chat_history (user_id,role,content) VALUES ($1,$2,$3)', [req.user.id, 'assistant', reply]);
+      return res.json({ reply, demo: true });
+    }
 
     const context = `
 User: ${user.name} | Score: ${user.productivity_score}/100 | Streak: ${user.streak} days
@@ -356,27 +444,31 @@ Habits:
 ${habitsRes.rows.map(h => `- ${h.name}: ${h.streak} day streak`).join('\n') || 'None'}
     `.trim();
 
-    // Save history
-    await pool.query('INSERT INTO chat_history (user_id,role,content) VALUES ($1,$2,$3)', [req.user.id, 'user', message]);
-
     const historyRes = await pool.query(
       'SELECT role,content FROM chat_history WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10',
       [req.user.id]
     );
     const history = historyRes.rows.reverse();
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 500,
-      system: `You are FocusAI, an elite productivity companion. Be concise, warm, and deeply actionable. Max 150 words per reply. No markdown, plain text only. Use the user's real data to give personalized, specific advice. Today's context:\n\n${context}`,
-      messages: history.map(h => ({ role: h.role, content: h.content })),
-    });
-
-    const reply = response.content[0].text;
-    await pool.query('INSERT INTO chat_history (user_id,role,content) VALUES ($1,$2,$3)', [req.user.id, 'assistant', reply]);
-    res.json({ reply });
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 500,
+        system: `You are FocusAI, an elite productivity companion. Be concise, warm, and deeply actionable. Max 150 words per reply. No markdown, plain text only. Use the user's real data to give personalized, specific advice. Today's context:\n\n${context}`,
+        messages: history.map(h => ({ role: h.role, content: h.content })),
+      });
+      const reply = response.content[0].text;
+      await pool.query('INSERT INTO chat_history (user_id,role,content) VALUES ($1,$2,$3)', [req.user.id, 'assistant', reply]);
+      res.json({ reply });
+    } catch (aiErr) {
+      // Real API failed (no credits, rate limit, etc) — fall back to mock so the demo still works
+      console.error('Anthropic API error, falling back to mock AI:', aiErr.message || aiErr);
+      const reply = mockChatReply(message, ctx);
+      await pool.query('INSERT INTO chat_history (user_id,role,content) VALUES ($1,$2,$3)', [req.user.id, 'assistant', reply]);
+      res.json({ reply, demo: true });
+    }
   } catch (e) {
-    console.error('AI error:', e);
+    console.error('AI route error:', e);
     res.status(500).json({ error: 'AI unavailable', reply: 'Having trouble connecting to AI right now. Try again in a moment.' });
   }
 });
@@ -395,29 +487,22 @@ Tasks: ${JSON.stringify(tasksRes.rows)}
 Today: ${new Date().toDateString()}
 Rules: Start at 8 AM, end at 6 PM, include breaks, put high-priority tasks in morning, add a focus buffer afternoon block.`;
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 800,
-      messages: [{ role: 'user', content: prompt }],
-    });
-
     let schedule = [];
+    if (FORCE_DEMO_AI) {
+      schedule = mockSchedule(tasksRes.rows);
+      return res.json(schedule);
+    }
     try {
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 800,
+        messages: [{ role: 'user', content: prompt }],
+      });
       const text = response.content[0].text.replace(/```json?|```/g, '').trim();
       schedule = JSON.parse(text);
-    } catch {
-      schedule = [
-        { time: '8:00 AM', title: 'Morning review & planning', type: 'teal', duration: '20 min', ai_note: 'Set intentions' },
-        { time: '9:00 AM', title: 'Deep work block — top priority task', type: 'purple', duration: '90 min', ai_note: 'Peak focus window' },
-        { time: '10:30 AM', title: 'Short break', type: 'gray', duration: '15 min', ai_note: 'Recharge' },
-        { time: '11:00 AM', title: 'Second priority task', type: 'purple', duration: '60 min', ai_note: 'Still high focus' },
-        { time: '12:00 PM', title: 'Lunch break', type: 'gray', duration: '60 min', ai_note: 'Rest' },
-        { time: '1:00 PM', title: 'Emails & communication', type: 'coral', duration: '30 min', ai_note: 'Low-energy task' },
-        { time: '2:00 PM', title: 'Meetings & collaboration', type: 'teal', duration: '60 min', ai_note: 'Social tasks post-lunch' },
-        { time: '3:00 PM', title: 'AI focus buffer (protected)', type: 'ai', duration: '60 min', ai_note: 'Overflow or deep thinking' },
-        { time: '4:00 PM', title: 'Admin & miscellaneous', type: 'gray', duration: '45 min', ai_note: 'Wind down' },
-        { time: '5:00 PM', title: 'Daily shutdown review', type: 'teal', duration: '15 min', ai_note: 'Close loops' },
-      ];
+    } catch (e) {
+      console.error('Schedule AI error, falling back to mock:', e.message || e);
+      schedule = mockSchedule(tasksRes.rows);
     }
     res.json(schedule);
   } catch (e) {
@@ -428,9 +513,14 @@ Rules: Start at 8 AM, end at 6 PM, include breaks, put high-priority tasks in mo
 
 // ── AI Task Suggest ──────────────────────────────────────────────────────────
 app.post('/api/ai/suggest-task', auth, async (req, res) => {
+  const goalsRes = await pool.query('SELECT title,progress FROM goals WHERE user_id=$1', [req.user.id]);
+  const tasksRes = await pool.query('SELECT title FROM tasks WHERE user_id=$1 AND done=false LIMIT 5', [req.user.id]);
+
+  if (FORCE_DEMO_AI) {
+    return res.json(mockTaskSuggestions(goalsRes.rows));
+  }
+
   try {
-    const goalsRes = await pool.query('SELECT title,progress FROM goals WHERE user_id=$1', [req.user.id]);
-    const tasksRes = await pool.query('SELECT title FROM tasks WHERE user_id=$1 AND done=false LIMIT 5', [req.user.id]);
     const prompt = `Suggest 3 specific, actionable tasks for a productive professional.
 Their goals: ${goalsRes.rows.map(g => g.title).join(', ') || 'Not set'}
 Their open tasks: ${tasksRes.rows.map(t => t.title).join(', ') || 'None'}
@@ -446,11 +536,8 @@ Return ONLY valid JSON (no markdown): [{"title":"...","priority":"medium","categ
     const suggestions = JSON.parse(text);
     res.json(suggestions);
   } catch (e) {
-    res.json([
-      { title: 'Review weekly priorities', priority: 'high', category: 'Planning' },
-      { title: 'Follow up with key stakeholders', priority: 'medium', category: 'Communication' },
-      { title: 'Document progress on current project', priority: 'medium', category: 'Documentation' },
-    ]);
+    console.error('Suggest-task AI error, falling back to mock:', e.message || e);
+    res.json(mockTaskSuggestions(goalsRes.rows));
   }
 });
 
@@ -485,9 +572,10 @@ app.get('/api/dashboard', auth, async (req, res) => {
 app.get('/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
 // ── Serve frontend ───────────────────────────────────────────────────────────
-app.use(express.static(path.join(__dirname, '../frontend/dist')));
+const frontendDist = path.join(__dirname, 'frontend', 'dist');
+app.use(express.static(frontendDist));
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+  res.sendFile(path.join(frontendDist, 'index.html'));
 });
 
 // ── Start ────────────────────────────────────────────────────────────────────
